@@ -6,198 +6,331 @@ import org.chipsalliance.cde.config.Parameters
 import xiangshan._
 
 /**
- * AHASD Control Module for XiangShan Processor
+ * AHASD Control Module
  * 
- * Integrates EDC (Entropy-History-Aware Drafting Control) and 
- * TVC (Time-Aware Pre-Verification Control) into CPU scheduler
+ * This module implements the CPU-side control logic for AHASD
+ * (Asynchronous Heterogeneous Architecture for LLM Speculative Decoding).
  * 
- * This module polls the EDC/TVC hardware units (implemented in PIM memory-mapped regions)
- * and makes scheduling decisions for speculative decoding tasks.
+ * Key responsibilities:
+ * 1. Poll EDC (Entropy-History-Aware Drafting Control) decisions
+ * 2. Poll TVC (Time-Aware Pre-Verification Control) decisions  
+ * 3. Manage async queues between NPU and PIM
+ * 4. Handle interrupts from hardware accelerators
+ * 5. Collect statistics for performance monitoring
+ * 
+ * Paper reference: "AHASD: Asynchronous Heterogeneous Architecture for 
+ * LLM Speculative Decoding on Mobile Devices"
  */
 
 class AHASDControlIO(implicit p: Parameters) extends XSBundle {
-  // Memory-mapped interface to EDC/TVC hardware
-  val edc_poll = Output(Bool())
-  val edc_decision = Input(Bool())  // Continue drafting or not
-  val edc_update = Valid(new EDCUpdateBundle)
+  // Memory-mapped register interface
+  val mmio = Flipped(new MemoryMappedIO)
   
-  val tvc_poll = Output(Bool())
-  val tvc_preverify_length = Input(UInt(8.W))
-  val tvc_update = Valid(new TVCUpdateBundle)
+  // EDC interface
+  val edc_should_continue = Output(Bool())
+  val edc_entropy_value = Input(UInt(32.W))
+  val edc_llr_count = Input(UInt(3.W))
+  val edc_update = Output(Bool())
   
-  // Queue management
-  val queue_status = Input(new QueueStatusBundle)
-  val queue_control = Valid(new QueueControlBundle)
+  // TVC interface  
+  val tvc_should_preverify = Output(Bool())
+  val tvc_preverify_length = Output(UInt(8.W))
+  val tvc_npu_cycles = Input(UInt(64.W))
+  val tvc_pim_cycles = Input(UInt(64.W))
+  
+  // Async queue status
+  val draft_queue_count = Input(UInt(8.W))
+  val feedback_queue_count = Input(UInt(8.W))
+  val preverify_queue_count = Input(UInt(8.W))
   
   // Interrupt signals
-  val edc_interrupt = Input(Bool())
-  val tvc_interrupt = Input(Bool())
-  val queue_overflow = Input(Bool())
+  val queue_overflow_irq = Output(Bool())
+  val edc_decision_irq = Output(Bool())
+  val tvc_decision_irq = Output(Bool())
 }
 
-class EDCUpdateBundle(implicit p: Parameters) extends XSBundle {
-  val batch_id = UInt(32.W)
-  val avg_entropy = UInt(16.W)  // Fixed-point entropy value
-  val accepted = Bool()
-}
-
-class TVCUpdateBundle(implicit p: Parameters) extends XSBundle {
-  val npu_cycles = UInt(64.W)
-  val pim_cycles = UInt(64.W)
-  val kv_length = UInt(32.W)
-  val draft_length = UInt(16.W)
-}
-
-class QueueStatusBundle(implicit p: Parameters) extends XSBundle {
-  val unverified_count = UInt(8.W)
-  val feedback_count = UInt(8.W)
-  val preverify_count = UInt(8.W)
-}
-
-class QueueControlBundle(implicit p: Parameters) extends XSBundle {
-  val clear_unverified = Bool()
-  val clear_feedback = Bool()
-  val priority_boost = Bool()
+class MemoryMappedIO extends Bundle {
+  val addr = Input(UInt(32.W))
+  val data_write = Input(UInt(64.W))
+  val data_read = Output(UInt(64.W))
+  val write_enable = Input(Bool())
+  val read_enable = Input(Bool())
+  val ready = Output(Bool())
 }
 
 class AHASDControl(implicit p: Parameters) extends XSModule {
   val io = IO(new AHASDControlIO)
   
-  // Configuration registers (memory-mapped)
-  val cfg_enable = RegInit(true.B)
-  val cfg_edc_poll_interval = RegInit(100.U(32.W))
-  val cfg_tvc_poll_interval = RegInit(50.U(32.W))
+  // ========== Configuration Registers ==========
+  // These match the configuration file: ahasd_control_config.txt
+  
+  val cfg_enable_ahasd = RegInit(true.B)
+  val cfg_edc_poll_interval = RegInit(100.U(32.W))  // CPU cycles
+  val cfg_tvc_measure_interval = RegInit(50.U(32.W))
   val cfg_queue_poll_interval = RegInit(20.U(32.W))
+  val cfg_overflow_threshold = RegInit(56.U(8.W))
+  val cfg_max_entries_per_poll = RegInit(4.U(8.W))
   
-  // State machines
-  val edc_state = RegInit(0.U(2.W))
-  val tvc_state = RegInit(0.U(2.W))
+  // ========== State Registers ==========
   
-  // Counters
-  val edc_poll_counter = RegInit(0.U(32.W))
-  val tvc_poll_counter = RegInit(0.U(32.W))
-  val queue_poll_counter = RegInit(0.U(32.W))
+  // Polling timers
+  val edc_poll_timer = RegInit(0.U(32.W))
+  val tvc_measure_timer = RegInit(0.U(32.W))
+  val queue_poll_timer = RegInit(0.U(32.W))
   
-  // Statistics
-  val total_edc_polls = RegInit(0.U(64.W))
-  val total_tvc_polls = RegInit(0.U(64.W))
-  val edc_suppressions = RegInit(0.U(32.W))
-  val tvc_preverifications = RegInit(0.U(32.W))
+  // EDC state tracking
+  val edc_last_decision = RegInit(true.B)
+  val edc_decision_count = RegInit(0.U(64.W))
+  val edc_suppress_count = RegInit(0.U(64.W))
   
-  // Default outputs
-  io.edc_poll := false.B
-  io.tvc_poll := false.B
-  io.edc_update.valid := false.B
-  io.edc_update.bits := DontCare
-  io.tvc_update.valid := false.B
-  io.tvc_update.bits := DontCare
-  io.queue_control.valid := false.B
-  io.queue_control.bits := DontCare
+  // TVC state tracking
+  val tvc_last_preverify_len = RegInit(0.U(8.W))
+  val tvc_preverify_count = RegInit(0.U(64.W))
+  val tvc_prevented_idles = RegInit(0.U(64.W))
   
-  when(cfg_enable) {
-    // EDC polling logic
-    edc_poll_counter := edc_poll_counter + 1.U
-    when(edc_poll_counter >= cfg_edc_poll_interval) {
-      edc_poll_counter := 0.U
-      io.edc_poll := true.B
-      total_edc_polls := total_edc_polls + 1.U
+  // Queue statistics
+  val draft_queue_max = RegInit(0.U(8.W))
+  val feedback_queue_max = RegInit(0.U(8.W))
+  val preverify_queue_max = RegInit(0.U(8.W))
+  val total_queue_overflows = RegInit(0.U(32.W))
+  
+  // Interrupt flags
+  val queue_overflow_flag = RegInit(false.B)
+  val edc_decision_flag = RegInit(false.B)
+  val tvc_decision_flag = RegInit(false.B)
+  
+  // ========== EDC Polling Logic ==========
+  
+  // Increment EDC poll timer
+  when(cfg_enable_ahasd) {
+    when(edc_poll_timer >= cfg_edc_poll_interval) {
+      edc_poll_timer := 0.U
       
-      // If EDC suggests suppression, increment counter
-      when(!io.edc_decision) {
-        edc_suppressions := edc_suppressions + 1.U
-      }
-    }
-    
-    // TVC polling logic
-    tvc_poll_counter := tvc_poll_counter + 1.U
-    when(tvc_poll_counter >= cfg_tvc_poll_interval) {
-      tvc_poll_counter := 0.U
-      io.tvc_poll := true.B
-      total_tvc_polls := total_tvc_polls + 1.U
+      // Trigger EDC decision query
+      io.edc_update := true.B
+      edc_decision_count := edc_decision_count + 1.U
       
-      // If TVC suggests pre-verification, increment counter
-      when(io.tvc_preverify_length > 0.U) {
-        tvc_preverifications := tvc_preverifications + 1.U
+      // Track suppression rate
+      when(!io.edc_should_continue) {
+        edc_suppress_count := edc_suppress_count + 1.U
       }
-    }
-    
-    // Queue management logic
-    queue_poll_counter := queue_poll_counter + 1.U
-    when(queue_poll_counter >= cfg_queue_poll_interval) {
-      queue_poll_counter := 0.U
       
-      // Check for queue overflow
-      when(io.queue_status.unverified_count > 56.U) {
-        io.queue_control.valid := true.B
-        io.queue_control.bits.priority_boost := true.B
-        io.queue_control.bits.clear_unverified := false.B
-        io.queue_control.bits.clear_feedback := false.B
+      // Update decision flag for interrupt
+      when(edc_last_decision =/= io.edc_should_continue) {
+        edc_decision_flag := true.B
       }
+      edc_last_decision := io.edc_should_continue
+      
+    }.otherwise {
+      edc_poll_timer := edc_poll_timer + 1.U
+      io.edc_update := false.B
     }
-    
-    // Handle EDC updates from NPU
-    when(io.edc_update.valid) {
-      // Forward update to EDC hardware
-      // (actual implementation would write to memory-mapped EDC registers)
+  }.otherwise {
+    io.edc_update := false.B
+  }
+  
+  // ========== TVC Polling Logic ==========
+  
+  // Increment TVC measurement timer
+  when(cfg_enable_ahasd) {
+    when(tvc_measure_timer >= cfg_tvc_measure_interval) {
+      tvc_measure_timer := 0.U
+      
+      // Calculate if pre-verification should be inserted
+      // This is a simplified version - actual logic is in hardware TVC module
+      val npu_ahead = io.tvc_npu_cycles > io.tvc_pim_cycles
+      val has_pending_drafts = io.draft_queue_count > 0.U
+      val should_preverify = npu_ahead && has_pending_drafts && 
+                            (io.draft_queue_count >= 2.U)
+      
+      io.tvc_should_preverify := should_preverify
+      
+      when(should_preverify) {
+        // Conservative pre-verification length (2-4 tokens)
+        io.tvc_preverify_length := Mux(io.draft_queue_count >= 4.U, 4.U, 2.U)
+        tvc_last_preverify_len := io.tvc_preverify_length
+        tvc_preverify_count := tvc_preverify_count + 1.U
+        tvc_decision_flag := true.B
+      }.otherwise {
+        io.tvc_preverify_length := 0.U
+      }
+      
+    }.otherwise {
+      tvc_measure_timer := tvc_measure_timer + 1.U
+      io.tvc_should_preverify := false.B
+      io.tvc_preverify_length := 0.U
     }
-    
-    // Handle TVC updates
-    when(io.tvc_update.valid) {
-      // Forward update to TVC hardware
-      // (actual implementation would write to memory-mapped TVC registers)
+  }.otherwise {
+    io.tvc_should_preverify := false.B
+    io.tvc_preverify_length := 0.U
+  }
+  
+  // ========== Queue Management ==========
+  
+  // Poll async queues for overflow detection
+  when(cfg_enable_ahasd) {
+    when(queue_poll_timer >= cfg_queue_poll_interval) {
+      queue_poll_timer := 0.U
+      
+      // Update max queue depths
+      when(io.draft_queue_count > draft_queue_max) {
+        draft_queue_max := io.draft_queue_count
+      }
+      when(io.feedback_queue_count > feedback_queue_max) {
+        feedback_queue_max := io.feedback_queue_count
+      }
+      when(io.preverify_queue_count > preverify_queue_max) {
+        preverify_queue_max := io.preverify_queue_count
+      }
+      
+      // Check for overflow
+      val any_overflow = (io.draft_queue_count >= cfg_overflow_threshold) ||
+                        (io.feedback_queue_count >= cfg_overflow_threshold) ||
+                        (io.preverify_queue_count >= cfg_overflow_threshold)
+      
+      when(any_overflow) {
+        queue_overflow_flag := true.B
+        total_queue_overflows := total_queue_overflows + 1.U
+      }
+      
+    }.otherwise {
+      queue_poll_timer := queue_poll_timer + 1.U
     }
   }
   
-  // Interrupt handling
-  val edc_interrupt_reg = RegNext(io.edc_interrupt)
-  val tvc_interrupt_reg = RegNext(io.tvc_interrupt)
-  val queue_overflow_reg = RegNext(io.queue_overflow)
+  // ========== Interrupt Output ==========
   
-  // Rising edge detection for interrupts
-  val edc_interrupt_trigger = io.edc_interrupt && !edc_interrupt_reg
-  val tvc_interrupt_trigger = io.tvc_interrupt && !tvc_interrupt_reg
-  val queue_overflow_trigger = io.queue_overflow && !queue_overflow_reg
+  io.queue_overflow_irq := queue_overflow_flag
+  io.edc_decision_irq := edc_decision_flag
+  io.tvc_decision_irq := tvc_decision_flag
   
-  when(edc_interrupt_trigger) {
-    // Handle EDC interrupt (e.g., pattern history table update complete)
+  // ========== Memory-Mapped Register Interface ==========
+  
+  // Register address map (byte addresses)
+  val REG_CONTROL         = 0x00.U  // Control register (enable/disable)
+  val REG_EDC_INTERVAL    = 0x08.U  // EDC poll interval
+  val REG_TVC_INTERVAL    = 0x10.U  // TVC measure interval
+  val REG_QUEUE_INTERVAL  = 0x18.U  // Queue poll interval
+  val REG_EDC_DECISION    = 0x20.U  // Last EDC decision
+  val REG_EDC_SUPPRESS    = 0x28.U  // EDC suppression count
+  val REG_TVC_PREVERIFY   = 0x30.U  // TVC pre-verification count
+  val REG_TVC_PREVENTED   = 0x38.U  // TVC prevented idles
+  val REG_DRAFT_QUEUE     = 0x40.U  // Draft queue depth
+  val REG_FEEDBACK_QUEUE  = 0x48.U  // Feedback queue depth
+  val REG_PREVERIFY_QUEUE = 0x50.U  // Pre-verify queue depth
+  val REG_QUEUE_OVERFLOWS = 0x58.U  // Total queue overflows
+  val REG_INTERRUPT_FLAGS = 0x60.U  // Interrupt flags
+  val REG_INTERRUPT_CLEAR = 0x68.U  // Interrupt clear (write-only)
+  
+  // Default MMIO output
+  io.mmio.data_read := 0.U
+  io.mmio.ready := true.B
+  
+  // Handle MMIO reads
+  when(io.mmio.read_enable) {
+    switch(io.mmio.addr) {
+      is(REG_CONTROL) {
+        io.mmio.data_read := cfg_enable_ahasd.asUInt
+      }
+      is(REG_EDC_INTERVAL) {
+        io.mmio.data_read := cfg_edc_poll_interval
+      }
+      is(REG_TVC_INTERVAL) {
+        io.mmio.data_read := cfg_tvc_measure_interval
+      }
+      is(REG_QUEUE_INTERVAL) {
+        io.mmio.data_read := cfg_queue_poll_interval
+      }
+      is(REG_EDC_DECISION) {
+        io.mmio.data_read := edc_last_decision.asUInt
+      }
+      is(REG_EDC_SUPPRESS) {
+        io.mmio.data_read := edc_suppress_count
+      }
+      is(REG_TVC_PREVERIFY) {
+        io.mmio.data_read := tvc_preverify_count
+      }
+      is(REG_TVC_PREVENTED) {
+        io.mmio.data_read := tvc_prevented_idles
+      }
+      is(REG_DRAFT_QUEUE) {
+        io.mmio.data_read := io.draft_queue_count
+      }
+      is(REG_FEEDBACK_QUEUE) {
+        io.mmio.data_read := io.feedback_queue_count
+      }
+      is(REG_PREVERIFY_QUEUE) {
+        io.mmio.data_read := io.preverify_queue_count
+      }
+      is(REG_QUEUE_OVERFLOWS) {
+        io.mmio.data_read := total_queue_overflows
+      }
+      is(REG_INTERRUPT_FLAGS) {
+        val flags = Cat(tvc_decision_flag, edc_decision_flag, queue_overflow_flag)
+        io.mmio.data_read := flags
+      }
+    }
   }
   
-  when(tvc_interrupt_trigger) {
-    // Handle TVC interrupt (e.g., pre-verification timing critical)
-  }
-  
-  when(queue_overflow_trigger) {
-    // Handle queue overflow - may need to clear or boost priority
-    io.queue_control.valid := true.B
-    io.queue_control.bits.clear_feedback := true.B
-    io.queue_control.bits.clear_unverified := false.B
-    io.queue_control.bits.priority_boost := false.B
+  // Handle MMIO writes
+  when(io.mmio.write_enable) {
+    switch(io.mmio.addr) {
+      is(REG_CONTROL) {
+        cfg_enable_ahasd := io.mmio.data_write(0)
+      }
+      is(REG_EDC_INTERVAL) {
+        cfg_edc_poll_interval := io.mmio.data_write(31, 0)
+      }
+      is(REG_TVC_INTERVAL) {
+        cfg_tvc_measure_interval := io.mmio.data_write(31, 0)
+      }
+      is(REG_QUEUE_INTERVAL) {
+        cfg_queue_poll_interval := io.mmio.data_write(31, 0)
+      }
+      is(REG_INTERRUPT_CLEAR) {
+        // Clear specified interrupt flags
+        when(io.mmio.data_write(0)) {
+          queue_overflow_flag := false.B
+        }
+        when(io.mmio.data_write(1)) {
+          edc_decision_flag := false.B
+        }
+        when(io.mmio.data_write(2)) {
+          tvc_decision_flag := false.B
+        }
+      }
+    }
   }
 }
 
 /**
- * Memory-mapped control interface for AHASD
- * 
- * This module exposes AHASD control as memory-mapped registers
- * that can be accessed from software or other hardware modules.
+ * Companion object for AHASDControl
+ * Provides utility functions and constants
  */
-class AHASDControlMemMap(baseAddr: Long)(implicit p: Parameters) extends XSModule {
-  val io = IO(new Bundle {
-    val mem = Flipped(new MemPortIO)
-    val ahasd = Flipped(new AHASDControlIO)
-  })
+object AHASDControl {
+  // Register address constants for software access
+  val REG_MAP = Map(
+    "CONTROL" -> 0x00,
+    "EDC_INTERVAL" -> 0x08,
+    "TVC_INTERVAL" -> 0x10,
+    "QUEUE_INTERVAL" -> 0x18,
+    "EDC_DECISION" -> 0x20,
+    "EDC_SUPPRESS" -> 0x28,
+    "TVC_PREVERIFY" -> 0x30,
+    "TVC_PREVENTED" -> 0x38,
+    "DRAFT_QUEUE" -> 0x40,
+    "FEEDBACK_QUEUE" -> 0x48,
+    "PREVERIFY_QUEUE" -> 0x50,
+    "QUEUE_OVERFLOWS" -> 0x58,
+    "INTERRUPT_FLAGS" -> 0x60,
+    "INTERRUPT_CLEAR" -> 0x68
+  )
   
-  // Register map
-  val OFFSET_CFG_ENABLE = 0x00
-  val OFFSET_EDC_POLL_INTERVAL = 0x04
-  val OFFSET_TVC_POLL_INTERVAL = 0x08
-  val OFFSET_QUEUE_POLL_INTERVAL = 0x0C
-  val OFFSET_EDC_DECISION = 0x10
-  val OFFSET_TVC_PREVERIFY_LEN = 0x14
-  val OFFSET_QUEUE_STATUS = 0x18
-  val OFFSET_STATISTICS = 0x20
+  // Default configuration values
+  val DEFAULT_EDC_POLL_INTERVAL = 100
+  val DEFAULT_TVC_MEASURE_INTERVAL = 50
+  val DEFAULT_QUEUE_POLL_INTERVAL = 20
+  val DEFAULT_OVERFLOW_THRESHOLD = 56
   
-  // Register read/write logic
-  // (Implementation details omitted for brevity)
+  def apply()(implicit p: Parameters): AHASDControl = new AHASDControl
 }
-
